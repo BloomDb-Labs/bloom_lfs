@@ -43,7 +43,12 @@
 //!   `PartialSwapDelta::last_flushed()`).
 
 use bytes::Bytes;
-use std::{any::Any, ops::Deref, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashSet,
+    ops::Deref,
+    sync::{atomic::AtomicPtr, Arc},
+};
 
 /// Base page default size of 4kb
 pub const FOUR_KB_PAGE: usize = 4096;
@@ -59,17 +64,59 @@ pub const PAGE_SIZE_16: usize = FOUR_KB_PAGE * 16;
 
 /// Llama Base Page
 pub struct BasePage {
-    state: [u8],
+    state: PageVariant,
+}
+/// Page variants
+impl BasePage {
+    pub fn small() -> PageVariant {
+        PageVariant::BasePageSmall {
+            state: [0u8; FOUR_KB_PAGE],
+        }
+    }
+    pub fn medium() -> PageVariant {
+        PageVariant::BasePageMedium {
+            state: [0u8; PAGE_SIZE_2],
+        }
+    }
+    pub fn large() -> PageVariant {
+        PageVariant::BasePageLarge {
+            state: [0u8; PAGE_SIZE_4],
+        }
+    }
+    pub fn even_bigger() -> PageVariant {
+        PageVariant::BasePageLargeLarge {
+            state: [0u8; PAGE_SIZE_16],
+        }
+    }
 }
 
-// ── Packed-bits constants ─────────────────────────────────────────────────────
-//
+pub enum PageVariant {
+    BasePageSmall { state: [u8; FOUR_KB_PAGE] },
+    BasePageMedium { state: [u8; PAGE_SIZE_2] },
+    BasePageLarge { state: [u8; PAGE_SIZE_4] },
+    BasePageLargeLarge { state: [u8; PAGE_SIZE_16] },
+}
+
+impl PageVariant {
+    pub fn get_state(&self) -> &[u8] {
+        match self {
+            PageVariant::BasePageSmall { state } => state,
+            PageVariant::BasePageMedium { state } => state,
+            PageVariant::BasePageLarge { state } => state,
+            PageVariant::BasePageLargeLarge { state } => state,
+        }
+    }
+}
+
+// ============================================
+// Packed-bits constants
+// ============================================
 //  u8 layout (stored at OFF_PACKED in the wire buffer):
 //
-//  ┌───┬───┬───┬───┬───┬─────────────────┐
-//  │ F │ P │ U │ E │ R │   (reserved)    │
-//  └───┴───┴───┴───┴───┴─────────────────┘
-//    7   6   5   4   3     2   1   0
+//  ┌───┬───┬───┬───┬───┬────┬─────────────────┐
+//  │ F │ P │ U │ E │ R │ Re │   (reserved)    │
+//  └───┴───┴───┴───┴───┴────┴─────────────────┘
+//    7   6   5   4   3   2         1   0
 
 /// `F` – Flush-done: delta has been durably flushed.
 pub const BIT_FLUSH_DONE: u8 = 1 << 7;
@@ -85,6 +132,9 @@ pub const BIT_FAILED_FLUSH: u8 = 1 << 4;
 
 /// `R` – Reclaim: delta is eligible for consolidation.
 pub const BIT_RECLAIM: u8 = 1 << 3;
+
+/// `Re` – Relocation delta: Used by Lss strategy to describe which parts of the pages have been relocated
+pub const BIT_RELOCATION: u8 = 1 << 2;
 
 //  Delta Format
 //
@@ -124,7 +174,6 @@ fn write_u64(buf: &mut [u8], off: usize, v: u64) {
 
 /// Assemble a complete wire buffer from its parts.
 fn build_wire(
-    lss_offset: u32,
     pid: u32,
     packed_bits: u8,
     prior_state: u64,
@@ -134,7 +183,7 @@ fn build_wire(
     let total = OFF_PAYLOAD + payload.len();
     let mut buf = vec![0u8; total];
     write_u32(&mut buf, OFF_LEN, total as u32);
-    write_u32(&mut buf, OFF_LSS, lss_offset);
+    write_u32(&mut buf, OFF_LSS, 0x0000);
     write_u32(&mut buf, OFF_PID, pid);
     buf[OFF_PACKED] = packed_bits;
     write_u64(&mut buf, OFF_PRIOR_STATE, prior_state);
@@ -167,23 +216,9 @@ pub struct DeltaData {
 }
 
 impl DeltaData {
-    fn new(
-        lss_offset: u32,
-        pid: u32,
-        packed_bits: u8,
-        prior_state: u64,
-        last_flushed: u64,
-        payload: &[u8],
-    ) -> Self {
+    fn new(pid: u32, packed_bits: u8, prior_state: u64, last_flushed: u64, payload: &[u8]) -> Self {
         Self {
-            bytes: build_wire(
-                lss_offset,
-                pid,
-                packed_bits,
-                prior_state,
-                last_flushed,
-                payload,
-            ),
+            bytes: build_wire(pid, packed_bits, prior_state, last_flushed, payload),
         }
     }
 
@@ -245,6 +280,22 @@ impl DeltaData {
     pub fn is_reclaimable(&self) -> bool {
         self.bytes[OFF_PACKED] & BIT_RECLAIM != 0
     }
+
+    /// `Re` – This delta describes page contents that have been relocated.
+    pub fn is_relocation(&self) -> bool {
+        self.bytes[OFF_PACKED] & BIT_RECLAIM != 0
+    }
+
+    // =============================================
+    // Setters
+    // =============================================
+
+    /*
+       We need specific setters for failed flushes and lss offsets
+       Deltas are not built with specifc lss offsets. Offsets are provided when deltas are flushed to disk
+
+
+    */
 }
 
 /// Discriminant returned by [`Delta::delta_type`].
@@ -255,6 +306,8 @@ pub enum DeltaKind {
     Flush = 0,
     PartialSwap = 1,
     Update = 2,
+    Reclaimable = 3,
+    Relocation = 4,
 }
 
 /// # Delta
@@ -352,6 +405,8 @@ pub enum DeltaKind {
 ///
 /// - `R` → Reclamation / Ready-for-compaction bit  
 ///   - Marks delta as eligible for consolidation.
+/// - `Re` -> Relocation
+///   – This delta describes page contents that have been relocated.
 ///
 /// Remaining bits are reserved for future extension.
 ///
@@ -366,6 +421,9 @@ pub trait Delta: Send + Sync {
 
     /// Discriminant for branching without a downcast.
     fn delta_type(&self) -> u8;
+
+    /// Returns the name of the of delta
+    fn type_name(&self) -> String;
 
     // --- storage access ------------------------------------------------------
 
@@ -415,17 +473,14 @@ pub struct FlushDelta {
 }
 
 impl FlushDelta {
-    pub fn new(prior: &dyn Delta, pid: u32, lss_offset: u32) -> Self {
+    pub fn new(prior: u64, pid: u32, lss_offset: u32) -> Self {
         Self {
-            data: DeltaData::new(
-                lss_offset,
-                pid,
-                BIT_FLUSH_DONE,
-                prior.prior_state_ptr() as u64,
-                0,
-                &[],
-            ),
+            data: DeltaData::new(pid, BIT_FLUSH_DONE, prior, 0, &[]),
         }
+    }
+
+    pub fn new_shared_delta(prior: u64, pid: u32, lss_offset: u32) -> DeltaRef {
+        Arc::new(FlushDelta::new(prior, pid, lss_offset))
     }
 }
 
@@ -442,6 +497,10 @@ impl Delta for FlushDelta {
     fn len(&self) -> usize {
         self.data.len()
     }
+
+    fn type_name(&self) -> String {
+        format!("FlushDelta()")
+    }
 }
 
 /// Carries an insert / update / delete change to a prior state (`U` bit).
@@ -450,10 +509,13 @@ pub struct UpdateDelta {
 }
 
 impl UpdateDelta {
-    pub fn new(payload: &[u8], prior_state: usize, pid: u32, lss_offset: u32) -> Self {
+    pub fn new(payload: &[u8], prior_state: usize, pid: u32) -> Self {
         Self {
-            data: DeltaData::new(lss_offset, pid, BIT_UPDATE, prior_state as u64, 0, payload),
+            data: DeltaData::new(pid, BIT_UPDATE, prior_state as u64, 0, payload),
         }
+    }
+    pub fn new_shared_delta(payload: &[u8], prior_state: usize, pid: u32) -> DeltaRef {
+        Arc::new(UpdateDelta::new(payload, prior_state, pid))
     }
 }
 
@@ -470,6 +532,9 @@ impl Delta for UpdateDelta {
     fn len(&self) -> usize {
         self.data.len()
     }
+    fn type_name(&self) -> String {
+        format!("UpdateDelta()")
+    }
 }
 
 /// Records that a page was partially evicted to secondary storage (`P` bit).
@@ -483,16 +548,9 @@ pub struct PartialSwapDelta {
 }
 
 impl PartialSwapDelta {
-    pub fn new(
-        payload: &[u8],
-        prior_state: usize,
-        last_flushed_state: usize,
-        pid: u32,
-        lss_offset: u32,
-    ) -> Self {
+    pub fn new(payload: &[u8], prior_state: usize, last_flushed_state: usize, pid: u32) -> Self {
         Self {
             data: DeltaData::new(
-                lss_offset,
                 pid,
                 BIT_PARTIAL_SWAP,
                 prior_state as u64,
@@ -502,12 +560,93 @@ impl PartialSwapDelta {
         }
     }
 
+    pub fn new_shared_delta(
+        payload: &[u8],
+        prior_state: usize,
+        last_flushed_state: usize,
+        pid: u32,
+    ) -> DeltaRef {
+        Arc::new(PartialSwapDelta::new(
+            payload,
+            prior_state,
+            last_flushed_state,
+            pid,
+        ))
+    }
+
     /// Pointer to the last stably-flushed state at the time of eviction.
     ///
     /// This method is intentionally absent from the `Delta` trait: it only
     /// makes sense on partial-swap deltas, so callers must downcast first.
     pub fn last_flushed(&self) -> usize {
         self.data.last_flushed_ptr()
+    }
+}
+
+pub struct RelocationDelta {
+    data: DeltaData,
+}
+
+impl RelocationDelta {
+    pub fn new(
+        payload: &[u8],
+        prior_state: usize,
+        last_flushed_state: usize,
+        pid: u32,
+        lss_offset: u32,
+    ) -> Self {
+        Self {
+            data: DeltaData::new(
+                pid,
+                BIT_RELOCATION,
+                prior_state as u64,
+                last_flushed_state as u64,
+                payload,
+            ),
+        }
+    }
+
+    pub fn new_shared_delta(
+        payload: &[u8],
+        prior_state: usize,
+        pid: u32,
+        last_flushed_state: usize,
+        lss_offset: u32,
+    ) -> DeltaRef {
+        Arc::new(RelocationDelta::new(
+            payload,
+            prior_state,
+            last_flushed_state,
+            pid,
+            lss_offset,
+        ))
+    }
+
+    /// Pointer to the last stably-flushed state at the time of eviction.
+    ///
+    /// This method is intentionally absent from the `Delta` trait: it only
+    /// makes sense on partial-swap deltas, so callers must downcast first.
+    pub fn last_flushed(&self) -> usize {
+        self.data.last_flushed_ptr()
+    }
+}
+
+impl Delta for RelocationDelta {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn delta_type(&self) -> u8 {
+        4
+    }
+    fn data(&self) -> &DeltaData {
+        &self.data
+    }
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn type_name(&self) -> String {
+        format!("RelocationDelta()")
     }
 }
 
@@ -524,6 +663,9 @@ impl Delta for PartialSwapDelta {
 
     fn len(&self) -> usize {
         self.data.len()
+    }
+    fn type_name(&self) -> String {
+        format!("PartialSwapDelta()")
     }
 }
 
@@ -547,9 +689,122 @@ impl Deref for FlushDelta {
     }
 }
 
-// same for FlushDelta and PartialSwapDelta
+impl Deref for RelocationDelta {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.data.bytes
+    }
+}
 
-// same for FlushDelta and PartialSwapDelta
+// =======================================
+//  Memory Representations
+// =======================================
+
+/// Representation of page states as seen in memmory
+// Maybe reimplement with rust based linked list struct
+pub enum PageState {
+    Chain {
+        current: DeltaRef,
+        prior_state: Arc<PageState>,
+        last_flushed: Option<Arc<PageState>>,
+    },
+    Base(PageVariant),
+}
+
+/*
+    Linked List format
+
+
+    pub enum PageStateNode {
+        Chain {
+            current: DeltaRef,
+            prior_state: Arc<PageStateNode>,
+            last_flushed: Option<Arc<PageStateNode>>,
+        },
+
+        Base(PageVariant),
+    }
+
+    pub struct PageState {
+        current: PageStateNode,
+        next: &PageStateNode
+    }
+*/
+
+impl PageState {
+    /// Prepend a regular delta to the head of the chain.
+    pub fn push_delta(self: Arc<Self>, delta: DeltaRef) -> Arc<Self> {
+        Arc::new(PageState::Chain {
+            current: delta,
+            prior_state: self,
+            last_flushed: None,
+        })
+    }
+
+    /// Prepend a partial-swap delta, recording where the last flush was.
+    /// `flush_point` should be the Arc<PageState> node that holds the FlushDelta.
+    pub fn push_partial_swap(
+        self: Arc<Self>,
+        delta: DeltaRef,
+        flush_point: Arc<PageState>,
+    ) -> Arc<Self> {
+        Arc::new(PageState::Chain {
+            current: delta,
+            prior_state: self,
+            last_flushed: Some(flush_point),
+        })
+    }
+}
+
+/// Iterates through the [`DeltaRef`] chains
+///
+/// Deltas may form dags due to flush deltas pointing at the prior states
+/// as well as the most recently flushed delta
+pub struct PageStateIter<'a> {
+    // stack of (node, came_from_flush_branch)
+    stack: Vec<&'a Arc<PageState>>,
+    visited: HashSet<*const PageState>,
+}
+
+impl<'a> Iterator for PageStateIter<'a> {
+    type Item = &'a Arc<PageState>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = self.stack.pop()?;
+            let ptr = Arc::as_ptr(node);
+
+            // skip already-visited nodes (the shared flush sub-chain)
+            if !self.visited.insert(ptr) {
+                continue;
+            }
+
+            if let PageState::Chain {
+                prior_state,
+                last_flushed,
+                ..
+            } = node.as_ref()
+            {
+                // push prior_state first so last_flushed is explored first (LIFO)
+                self.stack.push(prior_state);
+                if let Some(lf) = last_flushed {
+                    self.stack.push(lf);
+                }
+            }
+
+            return Some(node);
+        }
+    }
+}
+
+impl PageState {
+    pub fn iter(self: &Arc<Self>) -> PageStateIter<'_> {
+        PageStateIter {
+            stack: vec![self],
+            visited: std::collections::HashSet::new(),
+        }
+    }
+}
 
 // same for FlushDelta and PartialSwapDelta
 /// Attempt to downcast a `DeltaRef` to `&T`.
@@ -573,8 +828,7 @@ mod tests {
 
     #[test]
     fn flush_delta_sets_only_flush_bit() {
-        let prior = UpdateDelta::new(b"prior", 0xDEAD, 1, 10);
-        let d = FlushDelta::new(&prior, 1, 42);
+        let d = FlushDelta::new(0x0000, 1, 42);
 
         assert_eq!(d.delta_type(), DeltaKind::Flush as u8);
         assert!(d.is_durable());
@@ -586,20 +840,20 @@ mod tests {
     #[test]
     fn update_delta_roundtrip() {
         let payload = b"hello world";
-        let d = UpdateDelta::new(payload, 0x1234, 7, 99);
+        let d = UpdateDelta::new(payload, 0x1234, 7);
 
         assert_eq!(d.delta_type(), DeltaKind::Update as u8);
         assert!(d.data().is_update());
         assert!(!d.is_durable());
         assert_eq!(d.payload(), payload);
         assert_eq!(d.pid(), 7);
-        assert_eq!(d.lss_offset(), 99);
+
         assert_eq!(d.prior_state_ptr(), 0x1234);
     }
 
     #[test]
     fn partial_swap_delta_roundtrip() {
-        let d = PartialSwapDelta::new(b"swap", 0xAAAA, 0xBBBB, 3, 55);
+        let d = PartialSwapDelta::new(b"swap", 0xAAAA, 0xBBBB, 3);
 
         assert_eq!(d.delta_type(), DeltaKind::PartialSwap as u8);
         assert!(d.data().is_partial_swap());
@@ -611,9 +865,9 @@ mod tests {
     #[test]
     fn type_erased_dispatch_and_downcast() {
         let deltas: Vec<DeltaRef> = vec![
-            Arc::new(UpdateDelta::new(b"upd", 1, 10, 0)),
-            Arc::new(PartialSwapDelta::new(b"swp", 2, 3, 20, 1)),
-            Arc::new(FlushDelta::new(&UpdateDelta::new(b"p", 0, 5, 0), 5, 2)),
+            Arc::new(UpdateDelta::new(b"upd", 1, 10)),
+            Arc::new(PartialSwapDelta::new(b"swp", 2, 3, 20)),
+            Arc::new(FlushDelta::new(0x0000, 5, 2)),
         ];
 
         for d in &deltas {
@@ -637,14 +891,14 @@ mod tests {
 
     #[test]
     fn wrong_downcast_returns_none() {
-        let d: DeltaRef = Arc::new(UpdateDelta::new(b"x", 0, 0, 0));
+        let d: DeltaRef = Arc::new(UpdateDelta::new(b"x", 0, 0));
         assert!(downcast_delta::<FlushDelta>(&d).is_none());
         assert!(downcast_delta::<PartialSwapDelta>(&d).is_none());
     }
 
     #[test]
     fn packed_bits_do_not_bleed() {
-        let u = UpdateDelta::new(b"x", 0, 0, 0);
+        let u = UpdateDelta::new(b"x", 0, 0);
         assert_eq!(u.packed_bits() & BIT_FLUSH_DONE, 0, "update must not set F");
         assert_eq!(
             u.packed_bits() & BIT_PARTIAL_SWAP,
@@ -652,7 +906,7 @@ mod tests {
             "update must not set P"
         );
 
-        let p = PartialSwapDelta::new(b"x", 0, 0, 0, 0);
+        let p = PartialSwapDelta::new(b"x", 0, 0, 0);
         assert_eq!(
             p.packed_bits() & BIT_FLUSH_DONE,
             0,
@@ -662,6 +916,92 @@ mod tests {
             p.packed_bits() & BIT_UPDATE,
             0,
             "partial-swap must not set U"
+        );
+    }
+
+    #[test]
+    fn page_state_iter_validates_all_paths() {
+        let payload = b"hello world";
+        let lss_offset = 0xDEADBEEF_u64;
+
+        let page_state = Arc::new(PageState::Base(BasePage::small()));
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+
+        // Realistically all flushed deltas would be nested between flush delta opbject due to the nature of flushing in LLAMA
+        // The lss cleaning strategy will consolidate these 'fragmented 'flushed page states
+
+        let page_state = page_state.push_delta(FlushDelta::new_shared_delta(lss_offset, 0, 0));
+        let flush_point = Arc::clone(&page_state);
+
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+        let page_state = page_state.push_delta(UpdateDelta::new_shared_delta(payload, 0x0000, 0));
+        let page_state = page_state.push_partial_swap(
+            PartialSwapDelta::new_shared_delta(payload, 0x0000, 0x0000, 0),
+            flush_point,
+        );
+
+        let nodes: Vec<_> = page_state.iter().collect();
+
+        // every node visited exactly once despite shared flush sub-chain
+        let ptrs: Vec<_> = nodes.iter().map(|n| Arc::as_ptr(*n)).collect();
+        let unique: HashSet<_> = ptrs.iter().collect();
+        assert_eq!(ptrs.len(), unique.len(), "duplicate nodes in iteration");
+
+        // must terminate at exactly one Base
+        let base_count = nodes
+            .iter()
+            .filter(|n| matches!(n.as_ref(), PageState::Base(_)))
+            .count();
+        assert_eq!(base_count, 1, "expected exactly one Base node");
+
+        // ── path 1: main chain
+        let chain_nodes: Vec<_> = nodes
+            .iter()
+            .filter_map(|n| match n.as_ref() {
+                PageState::Chain { current, .. } => Some(current),
+                _ => None,
+            })
+            .collect();
+
+        // partial swap is present
+        assert!(
+            chain_nodes.iter().any(|d| d.delta_type() == 2),
+            "missing PartialSwapDelta"
+        );
+
+        // flush delta is present (shared between both paths)
+        assert!(
+            chain_nodes.iter().any(|d| d.delta_type() == 0),
+            "missing FlushDelta"
+        );
+
+        // ── path 2: last_flushed back-pointer reaches the flush node ─────────────
+        let partial_swap_node = nodes
+            .iter()
+            .find(|n| {
+                matches!(
+                    n.as_ref(),
+                    PageState::Chain { current, .. } if current.delta_type() == 2
+                )
+            })
+            .expect("no PartialSwapDelta node");
+
+        let lf = match partial_swap_node.as_ref() {
+            PageState::Chain { last_flushed, .. } => last_flushed.as_ref(),
+            _ => panic!(),
+        };
+        assert!(
+            lf.is_some(),
+            "PartialSwapDelta must carry a last_flushed pointer"
+        );
+
+        let lf_node = lf.unwrap();
+        assert!(
+            matches!(lf_node.as_ref(), PageState::Chain { current, .. } if current.delta_type() == 0),
+            "last_flushed must point directly at the FlushDelta node"
         );
     }
 }
