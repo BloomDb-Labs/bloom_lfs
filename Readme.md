@@ -1,6 +1,6 @@
 
 
-# Bloom_lfs — LLAMA Log-Structured Storage
+# Bloom_lfs 
 
 A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems.
 
