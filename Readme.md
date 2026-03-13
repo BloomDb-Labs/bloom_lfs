@@ -1,6 +1,6 @@
 
 
-# Bloom_lfs
+# Bloom_lfs — LLAMA Log-Structured Storage
 
 A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems.
 
@@ -25,7 +25,7 @@ The project currently implements the **log-structured secondary storage** compon
 │                    FlushBufferRing                          │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
 │  │ Buffer 0 │  │ Buffer 1 │  │ Buffer 2 │  │ Buffer 3 │     │
-│  │  4 KiB   │  │  4 KiB   │  │  4 KiB   │  │  4 KiB   │     │
+│  │  4 KB    │  │  4 KB    │  │  4 KB    │  │  4 KB    │     │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘     │
 │      ▲                                                      │
 │      └─── current_buffer (atomic pointer)                   │
@@ -163,6 +163,15 @@ Handles `io_uring`-backed write dispatch with two operating modes:
 - **Zero-copy** — kernel reads directly from userspace buffers
 - **Polled completions** — no context switch per completion
 
+## Planned Components
+
+The full LLAMA design includes (not yet implemented):
+
+- **Mapping Tables**: Lock-free in-memory index for locating page deltas
+- **Caching Layer**: Physical storage for hot deltas in memory
+- **Recovery Protocol**: Rebuild mapping table after crashes
+
+This repository currently implements the **log-structured secondary storage** foundation.
 
 ## Usage Example
 
@@ -193,7 +202,7 @@ let wal = LogStructuredStore::open_with_behavior(
 |---------------------------|------------------------------------------------|
 | Buffer size               | 4 KiB (aligned to page boundary)               |
 | Ring size                 | 4 buffers (default, configurable)              |
-| Max tail write distance   | `RING_SIZE × 4 KiB` = 16 KiB (tail-localized)  |
+| Max tail write distance   | `RING_SIZE × 4 KiB` = 16 KB (tail-localized)   |
 | Concurrency model         | Latch-free (atomic operations only)            |
 | Write amplification       | ~1.0 (each page written once)                  |
 | I/O pattern               | Sequential append (flash-optimized)            |
@@ -232,4 +241,3 @@ All `unsafe` code is audited and justified:
 ## References
 
 - **LLAMA Paper**: Lev-Ari et al., "LLAMA: A Cache/Storage Subsystem for Modern Hardware" (VLDB 2013)
-

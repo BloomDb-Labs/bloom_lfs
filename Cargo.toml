@@ -1,6 +1,6 @@
 [package]
 name = "bloom_lfs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems."
 license = "GPL-3.0"
