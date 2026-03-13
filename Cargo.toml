@@ -1,20 +1,31 @@
 [package]
-name = "llama"
+name = "bloom_lfs"
 version = "0.1.0"
 edition = "2021"
 
+exclude = ["benches/", "doc/", "loom-tests/", "test_store/"]
+
 [dependencies]
 bytes = "1.11.1"
-rand = { version = "0.8" }
+divan = "0.1.21"
+io-uring = "0.7.11"
+
+libc = "0.2"
+parking_lot = "0.12.5"
+loom = { version = "0.7", features = ["checkpoint"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] } # "full" includes macros, time, and rt features
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "flush_buffer"
-harness = false
+criterion = { version = "0.5" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [profile.profiling]
 inherits = "release"
 debug = true
+
+
+[features]
+loom = ["dep:loom"]
+
+[[bench]]
+name = "flush_buffer"
+harness = false

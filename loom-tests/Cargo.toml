@@ -1,0 +1,13 @@
+[package]
+name = "llama-loom-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+loom = { version = "0.7", features = ["checkpoint"], optional = true }
+
+[features]
+loom = ["dep:loom"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
