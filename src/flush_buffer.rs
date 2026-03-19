@@ -30,7 +30,7 @@
 //! 5. **On failure** at step 3, write a "Failed Flush" sentinel into the reserved
 //!    space.  This wastes a few bytes but removes all ambiguity about which writes
 //!    succeeded.
-//! 
+//!
 //! Though the currently implementation delegates the handling of all erroneous and invalid
 //! states to the caller, the current implementation of the Flush proceedure should lend itself
 //! well to to LLAMA flushing protocol
@@ -55,11 +55,13 @@
 //!   flush; prevents a second flush from being fired while the first is in flight.
 //! * **sealed** — set when the buffer is full or explicitly closed; prevents new
 //!   reservations.
-//! 
+//!
 //! Bits 7..2 represent unused space
 
 use std::{
     cell::UnsafeCell,
+    io,
+    os::fd::AsRawFd,
     pin::Pin,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -68,16 +70,19 @@ use std::{
     usize,
 };
 
-use io_uring::squeue::Entry;
+use io_uring::{
+    opcode,
+    squeue::{self, Entry},
+    types,
+};
 
-use crate::{flush_behaviour::FlushBehavior, log_structured_store::FOUR_KB_PAGE};
+use crate::flush_behaviour::FlushBehavior;
 use std::alloc::{alloc_zeroed, Layout};
-
 
 /// A 4 KB-aligned, heap-allocated byte buffer suitable for `O_DIRECT` I/O.
 ///
 /// `Buffer` owns a single contiguous allocation that is aligned to
-/// [`FOUR_KB_PAGE`] (4 096 bytes) — the minimum alignment required by
+/// [`MD`] (4 096 bytes) — the minimum alignment required by
 /// `O_DIRECT` on all common block devices.
 ///
 /// Cursor management is **not** handled here.  Instead, [`FlushBuffer`] uses
@@ -101,14 +106,14 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Allocate a zeroed, [`FOUR_KB_PAGE`]-aligned buffer of `size` bytes.
+    /// Allocate a zeroed, [`MD`]-aligned buffer of `size` bytes.
     ///
     /// # Panics
     ///
-    /// Panics if `size` is not a multiple of [`FOUR_KB_PAGE`], if the layout
+    /// Panics if `size` is not a multiple of [`MD`], if the layout
     /// is otherwise invalid, or if the allocator returns a null pointer.
     pub fn new_aligned(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, FOUR_KB_PAGE).expect("invalid layout");
+        let layout = Layout::from_size_align(size, MD).expect("invalid layout");
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "aligned allocation failed");
 
@@ -121,7 +126,7 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.size, FOUR_KB_PAGE).unwrap();
+        let layout = Layout::from_size_align(self.size, MD).unwrap();
         unsafe { std::alloc::dealloc(*self.buffer.get(), layout) };
     }
 }
@@ -144,7 +149,7 @@ const SEALED_BIT: usize = 1 << 0;
 ///
 /// Prevents a second flush from being fired concurrently and prevents new
 /// writers from entering a buffer that is already being drained.
-const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
+pub(crate) const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
 
 /// Amount added to the state word to record one additional active writer.
 const WRITER_SHIFT: usize = 8;
@@ -162,20 +167,22 @@ const OFFSET_ONE: usize = 1 << OFFSET_SHIFT;
 /// Default number of buffers in a [`FlushBufferRing`].
 pub const RING_SIZE: usize = 4;
 
+pub const MD: usize = 1024 * 1024;
+
 // ── State word helpers ────────────────────────────────────────────────────────
 
 #[inline(always)]
-fn state_offset(state: usize) -> usize {
+pub(crate) fn state_offset(state: usize) -> usize {
     state >> OFFSET_SHIFT
 }
 
 #[inline(always)]
-fn state_writers(state: usize) -> usize {
+pub(crate) fn state_writers(state: usize) -> usize {
     (state & WRITER_MASK) >> WRITER_SHIFT
 }
 
 #[inline(always)]
-fn state_sealed(state: usize) -> bool {
+pub(crate) fn state_sealed(state: usize) -> bool {
     state & SEALED_BIT != 0
 }
 
@@ -270,7 +277,7 @@ pub enum BufferMsg {
 #[derive(Debug)]
 pub struct FlushBuffer {
     /// Packed atomic state — see type-level docs for the bit layout.
-    state: AtomicUsize,
+    pub(crate) state: AtomicUsize,
 
     /// Backing aligned byte store shared with the `io_uring` submission path.
     pub(crate) buf: SharedBuffer,
@@ -280,7 +287,7 @@ pub struct FlushBuffer {
 
     /// The LSS address slot assigned to this buffer at seal time.
     ///
-    /// On-disk byte offset = `local_lss_address_slot × FOUR_KB_PAGE`.
+    /// On-disk byte offset = `local_lss_address_slot × MD`.
     /// Assigned by [`FlushBufferRing::next_address_range`] via fetch-add;
     /// guaranteed unique across all concurrently sealed buffers.
     pub(crate) local_lss_address_slot: AtomicUsize,
@@ -296,6 +303,7 @@ pub struct FlushBuffer {
 unsafe impl Send for FlushBuffer {}
 unsafe impl Sync for FlushBuffer {}
 
+const MB: usize = 1024 * 1024;
 impl FlushBuffer {
     /// Create a new `FlushBuffer` at ring position `buffer_number` with a
     /// `size`-byte aligned backing allocation.
@@ -309,7 +317,7 @@ impl FlushBuffer {
             state: AtomicUsize::new(0),
             buf: Arc::new(Buffer::new_aligned(size)),
             pos: buffer_number,
-            local_lss_address_slot: AtomicUsize::new(buffer_number),
+            local_lss_address_slot: AtomicUsize::new(0),
             submit_queue_entry: UnsafeCell::new(None),
         }
     }
@@ -347,16 +355,16 @@ impl FlushBuffer {
     /// * [`BufferError::EncounteredSealedBuffer`] — the buffer is sealed or a
     ///   flush is in progress; the caller should ask the ring to rotate.
     /// * [`BufferError::InsufficientSpace`] — `payload_size` bytes would exceed
-    ///   [`FOUR_KB_PAGE`]; the caller should seal the buffer and retry on the
+    ///   [`MD`]; the caller should seal the buffer and retry on the
     ///   next one.
     /// * [`BufferError::FailedReservation`] — the CAS failed due to contention;
     ///   the caller should retry immediately.
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `payload_size > FOUR_KB_PAGE`.
+    /// Panics in debug builds if `payload_size > MD`.
     pub fn reserve_space(&self, payload_size: usize) -> Result<usize, BufferError> {
-        assert!(payload_size <= FOUR_KB_PAGE, "payload larger than buffer");
+        assert!(payload_size <= MD, "payload larger than buffer");
 
         let state = self.state.load(Ordering::Acquire);
 
@@ -366,10 +374,9 @@ impl FlushBuffer {
 
         let offset = state_offset(state);
 
-        if offset + payload_size > FOUR_KB_PAGE {
+        if offset + payload_size > MD {
             return Err(BufferError::InsufficientSpace);
         }
-
 
         // Analagous to the increment_writers() method
         let new = state
@@ -514,6 +521,21 @@ impl FlushBuffer {
     pub(crate) fn state_snapshot(&self) -> usize {
         self.state.load(Ordering::Acquire)
     }
+
+    /// Spin until the flush-in-progress bit clears.
+    ///
+    /// Only call this after observing `FLUSH_IN_PROGRESS_BIT` set in the
+    /// return value of `set_flush_in_progress()`. The spin is tight but
+    /// bounded — flushes are a single `submit_and_wait(1)` call.
+    pub fn wait_for_flush(&self) {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & FLUSH_IN_PROGRESS_BIT == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
 }
 
 /// A fixed-size ring of [`FlushBuffer`]s that amortises writes into batched
@@ -586,7 +608,7 @@ impl FlushBufferRing {
             ring: buffers,
             next_index: AtomicUsize::new(1),
             _size: num_of_buffer,
-            next_address_range: AtomicUsize::new(4),
+            next_address_range: AtomicUsize::new(0),
             store: None,
         }
     }
@@ -613,7 +635,7 @@ impl FlushBufferRing {
             ring: buffers,
             next_index: AtomicUsize::new(1),
             _size: num_of_buffer,
-            next_address_range: AtomicUsize::new(4),
+            next_address_range: AtomicUsize::new(0),
             store: Some(flusher),
         }
     }
@@ -689,7 +711,6 @@ impl FlushBufferRing {
 
                 let prev = current.decrement_writers();
 
-
                 // Note: Atomic operations always yeild previous values
                 let was_last_writer = state_writers(prev) == 1;
                 let was_sealed = state_sealed(prev);
@@ -756,7 +777,7 @@ impl FlushBufferRing {
     ///
     /// This method is `pub(crate)` and is called internally by [`put`](Self::put)
     /// and by [`LogStructuredStore`](crate::log_structured_store::LogStructuredStore).
-    /// It is not part of the public-facing API 
+    /// It is not part of the public-facing API
     pub(crate) fn flush(&self, buffer: &FlushBuffer) {
         buffer.set_flush_in_progress();
 
@@ -770,6 +791,7 @@ impl FlushBufferRing {
         }
     }
 
+    
     /// Reset `buffer` for reuse after a completed flush.
     ///
     /// Clears the write offset, sealed bit, and flush-in-progress bit atomically
@@ -906,7 +928,7 @@ mod tests {
     /// reserve_space on a sealed buffer must return EncounteredSealedBuffer.
     #[test]
     fn reserve_on_sealed_buffer_returns_error() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         buf.set_sealed_bit_true().unwrap();
         assert!(matches!(
             buf.reserve_space(16),
@@ -917,7 +939,7 @@ mod tests {
     /// Sealing an already-sealed buffer must return the COMPEX error.
     #[test]
     fn double_seal_returns_error() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         buf.set_sealed_bit_true().unwrap();
         assert!(matches!(
             buf.set_sealed_bit_true(),
@@ -928,7 +950,7 @@ mod tests {
     /// Unsealing an already-unsealed buffer must return the COMPEX error.
     #[test]
     fn unseal_unsealed_returns_error() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         assert!(matches!(
             buf.set_sealed_bit_false(),
             Err(BufferError::EncounteredUnSealedBufferDuringCOMPEX)
@@ -938,7 +960,7 @@ mod tests {
     /// reserve_space on a flush-in-progress buffer must return EncounteredSealedBuffer.
     #[test]
     fn reserve_on_flush_in_progress_returns_error() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         buf.set_flush_in_progress();
         assert!(matches!(
             buf.reserve_space(16),
@@ -949,7 +971,7 @@ mod tests {
     /// Writer count increments and decrements must be symmetric.
     #[test]
     fn writer_count_symmetric() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         buf.increment_writers();
         buf.increment_writers();
         buf.increment_writers();
@@ -963,8 +985,8 @@ mod tests {
     /// A single exact-capacity reservation must consume the whole buffer.
     #[test]
     fn reserve_exact_capacity() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
-        let offset = buf.reserve_space(FOUR_KB_PAGE).unwrap();
+        let buf = FlushBuffer::new_buffer(0, MD);
+        let offset = buf.reserve_space(MD).unwrap();
         assert_eq!(offset, 0);
         // Next reservation must fail — no space left.
         assert!(matches!(
@@ -976,7 +998,7 @@ mod tests {
     /// Two sequential reservations must not overlap.
     #[test]
     fn sequential_reservations_no_overlap() {
-        let buf = FlushBuffer::new_buffer(0, FOUR_KB_PAGE);
+        let buf = FlushBuffer::new_buffer(0, MD);
         let a = buf.reserve_space(100).unwrap();
         let b = buf.reserve_space(100).unwrap();
         assert_eq!(a, 0);
@@ -994,7 +1016,7 @@ mod tests {
     /// receive the same offset, the atomic state word is broken.
     #[test]
     fn concurrent_reserve_space_no_overlap() {
-        let buf = Arc::new(FlushBuffer::new_buffer(99, FOUR_KB_PAGE));
+        let buf = Arc::new(FlushBuffer::new_buffer(99, MD));
         let seen: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
 
         const THREADS: usize = 8;
@@ -1057,8 +1079,8 @@ mod tests {
     /// After the write, current_buffer must point at a different buffer.
     #[test]
     fn exact_fill_triggers_rotate() {
-        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, FOUR_KB_PAGE);
-        let payload = make_payload("FILL", FOUR_KB_PAGE);
+        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD);
+        let payload = make_payload("FILL", MD);
 
         match put_with_retry(&ring, &payload) {
             Ok(BufferMsg::SuccessfullWrite) | Ok(BufferMsg::SuccessfullWriteFlush) => {}
@@ -1078,7 +1100,7 @@ mod tests {
     /// Seal a buffer explicitly and verify the ring rotates to the next slot.
     #[test]
     fn manual_seal_causes_rotate() {
-        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, FOUR_KB_PAGE);
+        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD);
 
         let current_before = unsafe {
             ring.current_buffer
@@ -1109,7 +1131,7 @@ mod tests {
     /// RingExhausted rather than deadlocking or panicking.
     #[test]
     fn ring_exhaustion_returns_error() {
-        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, FOUR_KB_PAGE);
+        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD);
 
         // Manually seal every buffer so none are available
         for i in 0..TEST_RING_SIZE {
@@ -1127,7 +1149,7 @@ mod tests {
     /// writes across multiple seal/rotate cycles without panicking.
     #[test]
     fn single_threaded_offset_uniqueness() {
-        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, FOUR_KB_PAGE);
+        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD);
 
         let mut rng = Lcg::new(0);
         let mut writes = 0usize;
@@ -1137,7 +1159,7 @@ mod tests {
 
         loop {
             let size = SIZES[rng.next_usize(SIZES.len())];
-            if data_written + size > FOUR_KB_PAGE * TEST_RING_SIZE {
+            if data_written + size > MD * TEST_RING_SIZE {
                 break;
             }
 
@@ -1163,7 +1185,7 @@ mod tests {
     /// Stress test: 2000 random-sized writes, single thread.
     #[test]
     fn single_threaded_stress() {
-        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, FOUR_KB_PAGE);
+        let ring = FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD);
         let mut writes = 0usize;
         let mut flushes = 0usize;
         let mut rng = Lcg::new(0x1234_5678);
@@ -1214,10 +1236,7 @@ mod tests {
     }
 
     fn multi_threaded_stress_helper(num_threads: usize) {
-        let ring = Arc::new(FlushBufferRing::with_buffer_amount(
-            TEST_RING_SIZE,
-            FOUR_KB_PAGE,
-        ));
+        let ring = Arc::new(FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD));
         let barrier = Arc::new(Barrier::new(num_threads));
         let total_writes = Arc::new(AtomicUsize::new(0));
         let total_flushes = Arc::new(AtomicUsize::new(0));
@@ -1324,10 +1343,7 @@ mod tests {
     /// multiple ring rotations.
     #[test]
     fn hammer_seal_concurrent_rotation() {
-        let ring = Arc::new(FlushBufferRing::with_buffer_amount(
-            TEST_RING_SIZE,
-            FOUR_KB_PAGE,
-        ));
+        let ring = Arc::new(FlushBufferRing::with_buffer_amount(TEST_RING_SIZE, MD));
         let barrier = Arc::new(Barrier::new(NUM_THREADS_SMALL));
 
         let handles: Vec<_> = (0..NUM_THREADS_SMALL)

@@ -53,9 +53,8 @@
 
 pub mod flush_buffer;
 pub mod log_structured_store;
-pub mod flush_behaviour; 
+pub mod flush_behaviour;
+pub mod open_options; 
 
 
-
-pub mod tests;
 

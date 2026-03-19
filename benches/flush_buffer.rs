@@ -1,7 +1,8 @@
 
+use bloom_lfs::flush_behaviour::FOUR_KB_PAGE;
 use bloom_lfs::flush_buffer::*;
 
-use bloom_lfs::log_structured_store::FOUR_KB_PAGE;
+
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion,
     Throughput,

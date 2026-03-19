@@ -59,15 +59,17 @@ use io_uring::{opcode, squeue, types, IoUring};
 #[allow(unused_imports)]
 use crate::log_structured_store::LogStructuredStore;
 
+use crate::flush_buffer::FlushBuffer;
 #[allow(unused_imports)]
 use crate::flush_buffer::RING_SIZE;
-use crate::{flush_buffer::FlushBuffer, log_structured_store::FOUR_KB_PAGE};
 use std::{
     fs::File,
     io,
     os::fd::AsRawFd,
     sync::{atomic::Ordering, Arc},
 };
+
+pub const FOUR_KB_PAGE: usize = 4096;
 
 /// Flush Buffers must adherer to Strict Serialized Ordered Writes
 #[allow(unused)]
@@ -106,7 +108,7 @@ pub type SharedAsyncFileWriter = Arc<parking_lot::Mutex<IoUring>>;
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub enum WriteMode {
-    /// Parallel localized writes — lock-free
+    /// Parallel localized writes
     TailLocalizedWrites,
     /// Serialized ordered writes — drain ordering enforced
     SerializedWrites,
@@ -122,10 +124,10 @@ pub enum WriteMode {
 /// interact with the store through [`FlushBehavior`].
 pub struct Appender {
     /// Shared `O_DIRECT` file handle — the LSS backing file.
-    store: Arc<File>,
+    pub(crate) store: Arc<File>,
     /// Shared `io_uring` instance.  Protected by a [`parking_lot::Mutex`] so
     /// that multiple threads can submit SQEs without data races.
-    flusher: SharedAsyncFileWriter,
+    pub(crate) flusher: SharedAsyncFileWriter,
     /// Determines SQE flags applied to every write submission.
     mode: WriteMode,
 }
@@ -226,65 +228,67 @@ impl Appender {
         Ok(())
     }
 
-    /// Submit a write and **block** until the kernel reports completion.
-    ///
-    /// Semantically equivalent to [`submit`](Self::submit) followed by an
-    /// immediate `submit_and_wait(1)`.  Suitable for tests, shutdown sequences,
-    /// or any context where you need to guarantee durability before proceeding.
-    ///
-    /// For high-throughput production writes prefer the async
-    /// [`submit`](Self::submit) path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`io::Error`] if the SQE push, the wait, or the CQE result
-    /// indicates failure.
-    pub fn submit_blocking(
-        &self,
-        buffer: &FlushBuffer,
-        buffer_data: &[u8],
-        at: u64,
-        buffer_ptr: u64,
-    ) -> io::Result<()> {
-        let flags = match self.mode {
-            WriteMode::TailLocalizedWrites => squeue::Flags::empty(),
-            WriteMode::SerializedWrites => squeue::Flags::IO_LINK,
-        };
+    
 
-        let sqe = opcode::Write::new(
-            types::Fd(self.store.as_raw_fd()),
-            buffer_data.as_ptr(),
-            buffer_data.len() as u32,
-        )
-        .offset(at)
-        .build()
-        .flags(flags)
-        .user_data(buffer_ptr);
+    // /// Submit a write and **block** until the kernel reports completion.
+    // ///
+    // /// Semantically equivalent to [`submit`](Self::submit) followed by an
+    // /// immediate `submit_and_wait(1)`.  Suitable for tests, shutdown sequences,
+    // /// or any context where you need to guarantee durability before proceeding.
+    // ///
+    // /// For high-throughput production writes prefer the async
+    // /// [`submit`](Self::submit) path.
+    // ///
+    // /// # Errors
+    // ///
+    // /// Returns [`io::Error`] if the SQE push, the wait, or the CQE result
+    // /// indicates failure.
+    // pub fn submit_blocking(
+    //     &self,
+    //     buffer: &FlushBuffer,
+    //     buffer_data: &[u8],
+    //     at: u64,
+    //     buffer_ptr: u64,
+    // ) -> io::Result<()> {
+    //     let flags = match self.mode {
+    //         WriteMode::TailLocalizedWrites => squeue::Flags::empty(),
+    //         WriteMode::SerializedWrites => squeue::Flags::IO_LINK,
+    //     };
 
-        let mut ring = self.flusher.lock();
+    //     let sqe = opcode::Write::new(
+    //         types::Fd(self.store.as_raw_fd()),
+    //         buffer_data.as_ptr(),
+    //         buffer_data.len() as u32,
+    //     )
+    //     .offset(at)
+    //     .build()
+    //     .flags(flags)
+    //     .user_data(buffer_ptr);
 
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| io::Error::other("SQ full"))?;
+    //     let mut ring = self.flusher.lock();
 
-            *buffer.submit_queue_entry.get() = Some(sqe);
-        }
+    //     unsafe {
+    //         ring.submission()
+    //             .push(&sqe)
+    //             .map_err(|_| io::Error::other("SQ full"))?;
 
-        // BLOCKING: Wait for at least 1 completion
-        ring.submit_and_wait(1)?;
+    //         *buffer.submit_queue_entry.get() = Some(sqe);
+    //     }
 
-        // Immediately check the completion
-        if let Some(cqe) = ring.completion().next() {
-            if cqe.result() < 0 {
-                return Err(io::Error::from_raw_os_error(-cqe.result()));
-            }
-            // Success!
-            return Ok(());
-        }
+    //     // BLOCKING: Wait for at least 1 completion
+    //     ring.submit_and_wait(1)?;
 
-        Err(io::Error::other("No completion received"))
-    }
+    //     // Immediately check the completion
+    //     if let Some(cqe) = ring.completion().next() {
+    //         if cqe.result() < 0 {
+    //             return Err(io::Error::from_raw_os_error(-cqe.result()));
+    //         }
+    //         // Success!
+    //         return Ok(());
+    //     }
+
+    //     Err(io::Error::other("No completion received"))
+    // }
 
     /// Acquire a mutex guard giving exclusive access to the underlying `io_uring`
     /// instance, including its completion queue.
@@ -386,33 +390,74 @@ impl FlushBehavior {
         }
     }
 
-    /// Submit a flush of the given buffer and **block** until it completes.
-    ///
-    /// Suitable for tests, shutdown sequences, or any context where you need to
-    /// guarantee that the buffer has been written to stable storage before
-    /// continuing.  Avoid on the hot write path — use the async
-    /// [`submit_buffer`](Self::submit_buffer) instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`io::Error`] if the write fails.
-    pub fn submit_buffer_and_wait(&self, buffer: &FlushBuffer) -> io::Result<()> {
-        match self {
-            FlushBehavior::WaitAppender(a) | FlushBehavior::NoWaitAppender(a) => {
-                let ptr = unsafe { *buffer.buf.buffer.get() };
-                let slice: &[u8] = unsafe { &*std::ptr::slice_from_raw_parts(ptr, FOUR_KB_PAGE) };
-                let ptr_to_buffer_position = buffer as *const FlushBuffer as u64;
+    // /// Submit a flush of the given buffer and **block** until it completes.
+    // ///
+    // /// Suitable for tests, shutdown sequences, or any context where you need to
+    // /// guarantee that the buffer has been written to stable storage before
+    // /// continuing.  Avoid on the hot write path — use the async
+    // /// [`submit_buffer`](Self::submit_buffer) instead.
+    // ///
+    // /// # Errors
+    // ///
+    // /// Returns an [`io::Error`] if the write fails.
+    // pub fn submit_buffer_and_wait(&self, buffer: &FlushBuffer) -> io::Result<()> {
+    //     match self {
+    //         FlushBehavior::WaitAppender(a) | FlushBehavior::NoWaitAppender(a) => {
+    //             let ptr = unsafe { *buffer.buf.buffer.get() };
+    //             let slice: &[u8] = unsafe { &*std::ptr::slice_from_raw_parts(ptr, FOUR_KB_PAGE) };
+    //             let ptr_to_buffer_position = buffer as *const FlushBuffer as u64;
 
-                a.submit_blocking(
-                    buffer,
-                    slice,
-                    buffer.local_lss_address_slot.load(Ordering::Acquire) as u64
-                        * FOUR_KB_PAGE as u64,
-                    ptr_to_buffer_position,
-                )
-            }
+    //             a.submit_blocking(
+    //                 buffer,
+    //                 slice,
+    //                 buffer.local_lss_address_slot.load(Ordering::Acquire) as u64
+    //                     * FOUR_KB_PAGE as u64,
+    //                 ptr_to_buffer_position,
+    //             )
+    //         }
+    //     }
+    // }
+
+    /// Submit an `fdatasync` with `IO_DRAIN` and block until it completes.
+    ///
+    /// `IO_DRAIN` causes the kernel to complete every previously submitted SQE
+    /// before executing this one, so all in-flight `submit_buffer` writes are
+    /// guaranteed durable before this returns.
+    pub fn sync_data(&self) -> io::Result<()> {
+        let appender = self.get_reader();
+
+        let sqe = opcode::Fsync::new(types::Fd(appender.store.as_raw_fd()))
+            .flags(types::FsyncFlags::DATASYNC)
+            .build()
+            .flags(squeue::Flags::IO_DRAIN);
+
+        let mut ring = appender.flusher.lock();
+
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|_| io::Error::other("SQ full"))?;
         }
+
+        ring.submit_and_wait(1)?;
+
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::other("no CQE for sync_data"))?;
+        drop(ring);
+
+
+        if cqe.result() < 0 {
+            return Err(io::Error::from_raw_os_error(-cqe.result()));
+        }
+
+        Ok(())
     }
+
+
+
+    
 
     /// Acquire exclusive access to the `io_uring` instance's completion queue.
     ///
@@ -424,6 +469,14 @@ impl FlushBehavior {
         match self {
             FlushBehavior::WaitAppender(appender) | FlushBehavior::NoWaitAppender(appender) => {
                 appender.cqueue()
+            }
+        }
+    }
+
+    pub fn get_reader(&self) -> &Appender {
+        match self {
+            FlushBehavior::WaitAppender(appender) | FlushBehavior::NoWaitAppender(appender) => {
+                appender
             }
         }
     }
