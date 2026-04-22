@@ -1,0 +1,14 @@
+[package]
+name = "log_structured_store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# LSS core
+buffer_ring = "0.2.6"
+crossbeam-channel = "0.5.15"
+dashmap = "6.1.0"
+io-uring = "0.7.11"
+libc = "0.2.183"
+parking_lot = "0.12.5"
+
